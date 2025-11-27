@@ -1,0 +1,449 @@
+---
+title: "Example for INTACT"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Example for INTACT}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r deps, include=FALSE}
+# Packages used only for figures
+plot_pkgs <- c("ggplot2","tidyr","patchwork","ggpubr","tidyselect")
+have_plot_pkgs <- vapply(plot_pkgs, requireNamespace, logical(1), quietly = TRUE)
+can_plot <- all(have_plot_pkgs)
+
+if (can_plot) {
+  # attach for convenience
+  for (p in plot_pkgs) library(p, character.only = TRUE)
+} else {
+  message("Note: skipping plotting sections; missing packages: ",
+          paste(plot_pkgs[!have_plot_pkgs], collapse = ", "))
+}
+```
+
+# Overview
+
+Welcome to **intactPA**!  
+This vignette demonstrates how to use the package to harmonize longitudinal
+physical activity features collected from multiple sources.
+
+We first show installation, then simulate data with known structure and apply
+`INTACT` alongside competing methods, and finally summarize accuracy metrics.
+
+# Installation
+
+If you have not installed the package yet, you can install it from GitHub:
+
+```{r install, eval=FALSE}
+# Install from GitHub (uncomment to run)
+# install.packages("devtools")
+# devtools::install_github("jingru-zhang/intactPA", build_vignettes = TRUE)
+```
+
+Load the package:
+```{r}
+set.seed(12)
+library(intactPA)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  fig.width = 7.5,
+  fig.height = 2.5,
+  fig.align = "center"
+)
+```
+
+# Simulation Example
+
+We simulate subject-level (X part) and visit-level (W part) components, add a
+common mean curve and a fixed effect, combine across two sources, and run
+`INTACT`. You can optionally introduce missingness by setting `nc <- 1`.
+
+```{r}
+nc <- 0                    # set to 1 to introduce missingness
+subnum <- c(200, 200)      # subjects per source
+
+# Helper function to generate simulated data
+generdata <- function(n, Phi, U, Lam, D, noise = 0) {
+  M <- length(U)
+  p <- nrow(Phi)
+  d <- ncol(Phi)
+  data <- data.true <- eij <- vector("list", M)
+  
+  for (m in 1:M) {
+    xi <- matrix(rnorm(n[m] * d), d, n[m])
+    data[[m]] <- t(Phi %*% U[[m]] %*% sqrt(Lam * D[[m]]) %*% xi)  # n x p
+    eij[[m]] <- matrix(rnorm(n[m] * p), n[m], p) * noise
+    data[[m]] <- data[[m]] + eij[[m]]
+    data.true[[m]] <- t(Phi %*% sqrt(Lam) %*% xi)
+  }
+  
+  list(data = data, data.true = data.true, eij = eij)
+}
+
+# Load example basis functions and parameters:
+# Contains: Phixfun, Phiwfun, alpha1, beta1, Ux, Uw, Dx, Dw
+data(simuPhifun)
+
+Lamx <- diag(c(3.6, 2.4, 1)) / 2
+Lamw <- diag(c(2.0, 1.4, 1.0)) / 2
+
+p <- nrow(Phixfun)
+M <- 2
+genday <- list(sample(3:7, subnum[1], replace = TRUE),
+               sample(3:7, subnum[2], replace = TRUE))
+obsnum <- unlist(lapply(genday, sum))
+
+# Generate subject-level and visit-level components
+genXdata <- generdata(subnum, Phixfun, Ux, Lamx, Dx, noise = 0.0)
+genX <- genXdata$data
+genWdata <- generdata(obsnum, Phiwfun, Uw, Lamw, Dw, noise = 0.2)
+genW <- genWdata$data
+
+# Assemble full observations per source
+genY <- zz.sub <- vector("list", M)
+zzall <- c()
+cumsub <- c(0, cumsum(subnum))
+
+for (m in 1:M) {
+  genY[[m]] <- matrix(0, obsnum[m], p)
+  cumday <- c(0, cumsum(genday[[m]]))
+  
+  for (sub in 1:subnum[m]) {
+    subrow <- (cumday[sub] + 1):cumday[sub + 1]
+    genY[[m]][subrow, ] <- matrix(genX[[m]][sub, ], genday[[m]][sub], p, byrow = TRUE) +
+                           genW[[m]][subrow, ]
+  }
+  
+  # Subject-level covariate and fixed effect
+  zz.sub[[m]] <- rnorm(subnum[m], mean = 1, sd = 0.5)
+  zz <- rep(zz.sub[[m]], times = genday[[m]])
+  genY[[m]] <- genY[[m]] + zz %*% t(beta1) + matrix(alpha1, obsnum[m], p, byrow = TRUE)
+  
+  rownames(genY[[m]]) <- rep((cumsub[m] + 1):cumsub[m + 1], times = genday[[m]])
+  zzall <- c(zzall, zz)
+}
+
+# Package into data.frame and feature matrix
+mydf0 <- data.frame(
+  subid = c(rownames(genY[[1]]), rownames(genY[[2]])),
+  zmat  = zzall,
+  batch = c(rep(0, nrow(genY[[1]])), rep(1, nrow(genY[[2]])))
+)
+
+Yraw <- rbind(genY[[1]], genY[[2]])
+rownames(Yraw) <- mydf0$subid
+
+# Optionally introduce missingness
+if (nc == 1) {
+  Yraw.nc <- Yraw
+  Yraw.nc[sample(length(Yraw.nc), 0.3 * nrow(Yraw.nc) * ncol(Yraw.nc))] <- NA
+  Yraw <- Yraw.nc
+}
+
+# INTACT configuration
+formula      <- "zmat"
+needlog      <- 0
+comparisons  <- 1  # also compute competing methods
+act          <- 1
+wpve         <- 0.5
+dd           <- NULL
+
+# Run INTACT
+reall <- INTACT(mydf0, Yraw, formula, needlog, comparisons, act, wpve, dd)
+
+# Extract selected results
+multipar    <- reall$reintact$multipar
+Y_intact    <- reall$reintact$Y
+Eta_intact  <- reall$reintact$Eta
+Y_intact0   <- reall$reintact0$Y
+Eta_intact0 <- reall$reintact0$Eta
+
+# Competing methods
+Y_raw     <- reall$reraw$Y
+Eta_raw   <- reall$reraw$Eta
+Y_sim     <- reall$resim$Y
+Eta_sim   <- reall$resim$Eta
+Y_quan    <- reall$requan$Y
+Eta_quan  <- reall$requan$Eta
+Y_lcombat <- reall$relcombat$Y
+Eta_lcombat <- reall$relcombat$Eta
+```
+
+# Accuracy Metrics
+
+We can now evaluate the estimation accuracy of the harmonized data.  
+
+The function `getMVDV` compares estimated covariance structures with the truth 
+and across multiple sources.
+
+```{r}
+Sim_raw     <- getMVDV(Phixfun, Lamx, Phiwfun, Lamw, Eta_raw,     multipar)
+Sim_sim     <- getMVDV(Phixfun, Lamx, Phiwfun, Lamw, Eta_sim,     multipar)
+Sim_quan    <- getMVDV(Phixfun, Lamx, Phiwfun, Lamw, Eta_quan,    multipar)
+Sim_lcombat <- getMVDV(Phixfun, Lamx, Phiwfun, Lamw, Eta_lcombat, multipar)
+Sim_intact  <- getMVDV(Phixfun, Lamx, Phiwfun, Lamw, Eta_intact,  multipar)
+Sim_intact0 <- getMVDV(Phixfun, Lamx, Phiwfun, Lamw, Eta_intact0, multipar)
+
+# Print first four entries (MV.X, MV.W, DV.X, DV.W)
+unlist(Sim_raw[1:4])
+unlist(Sim_sim[1:4])
+unlist(Sim_quan[1:4])
+unlist(Sim_lcombat[1:4])
+unlist(Sim_intact[1:4])
+unlist(Sim_intact0[1:4])
+```
+
+# Visualizations
+## Mean curves across methods
+```{r,eval=can_plot}
+# plotting helper
+plotmcurve <- function(usephi, tx, ss = 9) {
+  df <- as.data.frame(usephi)
+  colnames(df) <- c("curve1", "curve2")
+  df$t <- 1:nrow(df)
+
+  df_long <- tidyr::pivot_longer(
+    df,
+    cols = tidyselect::starts_with("curve"),
+    names_to = "curve",
+    values_to = "value"
+  )
+
+  ggplot(df_long, aes(x = t, y = value, color = curve, linetype = curve)) +
+    geom_line() +
+    scale_color_manual(values = c("curve1" = "black", "curve2" = "blue")) +
+    scale_linetype_manual(values = c("curve1" = "dashed", "curve2" = "dotted")) +
+    labs(title = tx, x = "", y = "") +
+    theme_minimal() +
+    theme(
+      panel.background = element_blank(),
+      plot.background = element_blank(),
+      panel.grid = element_blank(),
+      panel.border = element_rect(fill = NA, color = "black"),
+      axis.line = element_blank(),
+      axis.ticks = element_line(),
+      axis.text.x = element_text(size = ss),
+      plot.title = element_text(hjust = 0.5, size = 10),
+      legend.position = "none"
+    )
+}
+
+trim <- function(p, margin_pt = 0) {
+  p + theme(plot.margin = unit(rep(margin_pt, 4), "pt"))
+}
+
+ss = 6.3
+mycurve = exp(cbind(colMeans(Y_raw[[1]]),colMeans(Y_raw[[2]])))-1
+mcurve.raw = plotmcurve(mycurve,'raw',ss)
+mycurve = exp(cbind(colMeans(Y_sim[[1]]),colMeans(Y_sim[[2]])))-1
+mcurve.sim = plotmcurve(mycurve,'standard',ss)
+mycurve = exp(cbind(colMeans(Y_quan[[1]]),colMeans(Y_quan[[2]])))-1
+mcurve.quan = plotmcurve(mycurve,'quantile',ss)
+mycurve = exp(cbind(colMeans(Y_lcombat[[1]]),colMeans(Y_lcombat[[2]])))-1
+mcurve.com = plotmcurve(mycurve,'L-ComBat',ss)
+mycurve = exp(cbind(colMeans(Y_intact[[1]]),colMeans(Y_intact[[2]])))-1
+mcurve.int = plotmcurve(mycurve,'INTACT',ss)
+mycurve = exp(cbind(colMeans(Y_intact0[[1]]),colMeans(Y_intact0[[2]])))-1
+mcurve.int0 = plotmcurve(mycurve,expression(INTACT[0]),ss)
+
+mcurveall <- (
+  trim(mcurve.raw)  +
+  trim(mcurve.sim)  +
+  trim(mcurve.quan) +
+  trim(mcurve.com)  +
+  trim(mcurve.int)  +
+  trim(mcurve.int0)
+) + plot_layout(ncol = 6, guides = "collect")
+
+mcurveall
+```
+
+## Covariance difference heatmaps
+```{r,eval=can_plot}
+getVardiff = function(Y){
+  M = 2
+  var.l1 = var.l2 = vector("list",M)
+  for(m in 1:M){
+    id = rownames(Y[[m]])
+    fpca <- fastmfpca(Y = as.matrix(Y[[m]]), id = id, twoway = FALSE, pve = 1)
+    funbasis = as.matrix(fpca$funbasis)
+    var.l1[[m]] = funbasis %*% fpca$Thetamat[[1]] %*% t(funbasis)
+    var.l2[[m]] = funbasis %*% fpca$Thetamat[[2]] %*% t(funbasis)
+  }
+  dvar.l1 = var.l1[[1]] - var.l1[[2]]
+  dvar.l2 = var.l2[[1]] - var.l2[[2]]
+  diffvar = list(dvar.l1, dvar.l2, var.l1, var.l2)
+  names(diffvar) = c("l1: M1 vs M2","l2: M1 vs M2","var.l1","var.l2")
+  return(diffvar)
+}
+
+diff_raw = getVardiff(Eta_raw)
+diff_sim = getVardiff(Eta_sim)
+diff_quan = getVardiff(Eta_quan)
+diff_lcombat = getVardiff(Eta_lcombat)
+diff_intact = getVardiff(Eta_intact)
+diff_intact0 = getVardiff(Eta_intact0)
+
+myheat = vector("list",2)
+yy = c("X part","W part")
+for (chl in 1:2) {
+  t0 = as.matrix(diff_raw[[chl]])*multipar^2
+  t1 = as.matrix(diff_sim[[chl]])*multipar^2
+  t2 = as.matrix(diff_quan[[chl]])*multipar^2
+  t3 = as.matrix(diff_lcombat[[chl]])*multipar^2
+  t4 = as.matrix(diff_intact[[chl]])*multipar^2
+  t5 = as.matrix(diff_intact0[[chl]])*multipar^2
+
+  num.method = 6
+  dimp = nrow(t0)
+  value = c(as.vector(t0),as.vector(t1),as.vector(t2),
+            as.vector(t3),as.vector(t4),as.vector(t5)) 
+  method = factor(rep(c("raw","standard","quantile",
+                        "L-ComBat","INTACT","INTACT0"),each=dimp^2),
+                  levels = c("raw","standard","quantile",
+                             "L-ComBat","INTACT","INTACT0"))
+
+  IDx = rep(rep(1:dimp,dimp),num.method)
+  IDy = rep(rep(1:dimp,each=dimp),num.method) 
+  dataf = data.frame(IDx,IDy,value,method)
+  levels(dataf$method) <- c("raw","standard","quantile",
+                            "L-ComBat","INTACT","INTACT[0]")
+
+  myheat[[chl]] = ggplot(dataf, aes(IDx,IDy)) + 
+    facet_grid(.~method)  +
+    geom_tile(aes(fill = value)) + theme_bw() + theme(panel.grid = element_blank(), axis.line = element_blank()) +
+    theme(strip.text = element_text(colour = 'black', size = rel(1.2)), strip.background = element_blank()) +
+    theme(axis.text.x = element_blank(), axis.ticks.x=element_blank()) + xlab("") +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) + ylab(yy[chl]) + 
+    theme(legend.title = element_blank()) +
+    scale_fill_gradient2(low = '#0571b0', high = '#ca0020',midpoint=0) +
+    facet_grid(.~method, labeller = label_parsed)
+}
+
+myheat[[1]] = myheat[[1]] + theme(axis.text=element_text(size=10),
+                                  axis.title=element_text(size=12))+
+  theme(plot.title = element_text(hjust = 0.5,size=12))+
+  theme(legend.text=element_text(size=10))+
+  theme(strip.text.x = element_text(size = 12))
+myheat[[2]] = myheat[[2]] + theme(axis.text=element_text(size=10),
+                                  axis.title=element_text(size=12))+
+  theme(plot.title = element_text(hjust = 0.5,size=12))+
+  theme(legend.text=element_text(size=10))+
+  theme(strip.text.x = element_text(size = 12))
+
+common_limits <- c(-0.03, 0.03)
+common_scale <- scale_fill_gradient2(
+  low       = "#0571b0",
+  mid       = "white",
+  high      = "#ca0020",
+  midpoint  = 0,
+  limits    = common_limits,
+  name      = NULL
+)
+myheat[[1]] <- myheat[[1]] + common_scale
+myheat[[2]] <- myheat[[2]] + common_scale
+
+# Heatmaps of covariance differences between sources
+# the first row is for X part and the second row is for W part
+heatdiffall = myheat[[1]] + myheat[[2]] +
+  plot_layout(ncol = 1, nrow = 2, guides="collect") & 
+  theme(legend.position = "right")
+heatdiffall 
+```
+
+## Estimation results
+```{r,eval=can_plot}
+# d is 2-dimensional vector giving the estimated numbers of components for the X- and W-parts, respectively.
+d = reall$d
+d
+
+fixeffs = reall$fixeffs
+alpha1.hat = fixeffs[1,]*multipar
+beta1.hat  = fixeffs[2,]*multipar
+
+# Common mean curve (true vs estimated)
+ss = 6.3
+alphacurve = plotmcurve(cbind(alpha1, alpha1.hat), expression({alpha}(t)), ss)
+betacurve  = plotmcurve(cbind(beta1,  beta1.hat ), expression({beta}(t)),  ss)
+
+alphacurve
+betacurve
+```
+
+## Common eigenfunctions (true vs estimated)
+```{r,eval=can_plot}
+Xi.x = -reall$Xi.x
+Xi.w = -reall$Xi.w
+
+Phixfun.a = Phiwfun.a = vector("list",2)
+for (i in 1:2) {
+  Phixfun.a[[i]] = Phixfun %*% Ux[[i]]
+  Phiwfun.a[[i]] = Phiwfun %*% Uw[[i]]
+}
+
+plotphi <- function(usephi, tx, ss = 9) {
+  df <- as.data.frame(usephi)
+  colnames(df) <- c("phicom", "phi1", "phi2", "phicomest")
+  df$t <- 1:nrow(df)
+
+  df_long <- tidyr::pivot_longer(
+    df,
+    cols = tidyselect::starts_with("phi"),
+    names_to = "curve",
+    values_to = "value"
+  )
+
+  ggplot(df_long, aes(x = t, y = value, color = curve, linetype = curve)) +
+    geom_line() +
+    scale_color_manual(values = c("phicom" = "red", "phi1" = "black",
+                                  "phi2" = "blue", "phicomest" = "purple")) +
+    scale_linetype_manual(values = c("phicom" = "solid", "phi1" = "dashed",
+                                     "phi2" = "dotted", "phicomest" = "solid")) +
+    labs(title = tx, x = "", y = "") +
+    theme_minimal() +
+    theme(
+      panel.background = element_blank(),
+      plot.background = element_blank(),
+      panel.grid = element_blank(),
+      panel.border = element_rect(fill = NA, color = "black"),
+      axis.line = element_blank(),
+      axis.ticks = element_line(),
+      axis.text.x = element_text(size = ss),
+      plot.title = element_text(hjust = 0.5, size = 10),
+      legend.position = "none"
+    )
+}
+
+gphi.x = vector("list",3)
+for(j in 1:3){
+  usephi = cbind(Phixfun[,j],Phixfun.a[[1]][,j],Phixfun.a[[2]][,j],Xi.x[,j])
+  tx = paste('Eigenfunction ',j,' for X part',sep="")
+  gphi.x[[j]] = plotphi(usephi,tx)
+}
+gphi.w = vector("list",3)
+for(j in 1:3){
+  usephi = cbind(Phiwfun[,j],Phiwfun.a[[1]][,j],Phiwfun.a[[2]][,j],Xi.w[,j])
+  tx = paste('Eigenfunction ',j,' for W part',sep="")
+  gphi.w[[j]] = plotphi(usephi,tx)
+}
+
+phix.all = gphi.x[[1]] + gphi.x[[2]] + gphi.x[[3]] + plot_layout(ncol = 3,nrow = 1,guides = "collect")
+phiw.all = gphi.w[[1]] + gphi.w[[2]] + gphi.w[[3]] + plot_layout(ncol = 3,nrow = 1,guides = "collect")
+
+ggarrange(phix.all, phiw.all, ncol = 1, labels = c(""), font.label = list(size = 20))
+```
+
+
+
+
+
+
+
+
+
+
+
+

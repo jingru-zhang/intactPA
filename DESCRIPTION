@@ -1,0 +1,43 @@
+Package: intactPA
+Type: Package
+Title: Integration of Longitudinal Physical Activity Data from Multiple Sources Using the INTACT Method
+Version: 0.1.0
+Date: 2025-11-27
+Authors@R:
+    person(given = "Jingru",
+           family = "Zhang",
+           email = "jr_zhang@fudan.edu.cn",
+           role = c("aut", "cre"))
+Author: Jingru Zhang [aut, cre]
+Maintainer: Jingru Zhang <jr_zhang@fudan.edu.cn>
+Description: Harmonizes longitudinal physical activity data collected from multiple
+    sources or batches, providing integrated observations suitable for downstream
+    analysis while preserving biologically and behaviorally relevant variation.
+Depends:
+    R (>= 4.4.3)
+Imports:
+    longCombat,
+    softImpute,
+    irlba,
+    broman,
+    mgcv,
+    splines,
+    quadprog,
+    lme4
+Suggests:
+    knitr,
+    rmarkdown,
+    ggplot2,
+    tidyr,
+    tidyselect,
+    patchwork,
+    ggpubr
+Remotes:
+    github::jcbeer/longCombat
+VignetteBuilder: knitr
+License: GPL (>= 2)
+Encoding: UTF-8
+LazyData: true
+URL: https://github.com/jingru-zhang/intactPA
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
